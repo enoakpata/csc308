@@ -21,8 +21,11 @@ fn my_entry_point(_boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     let buffer = _boot_info.framebuffer.as_mut().unwrap().buffer_mut();
     let mut frame_buffer_writer = FrameBufferWriter::new(buffer, frame_buffer_info);
 
-    frame_buffer_writer.print("Hello, world!\nThis is a test.\n\\cPurple Text\\r \tIndented Text");    
-
+   for i in 0..45
+    {    
+        frame_buffer_writer.print("Hello, world!\nThis is a test.\n\\cPurple Text\\r \tIndented Text\n");    
+        frame_buffer_writer.print("This is a really really really really really really really long statement that gets to the end of the buffer and should move to the next line\n");
+    }
     loop {
         hlt(); // Stop x86_64 from being unnecessarily busy while looping
     }
