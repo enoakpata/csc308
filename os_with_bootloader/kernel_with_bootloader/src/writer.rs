@@ -3,7 +3,7 @@ use core::{
     fmt::{self, Write},
     ptr,
 };
-use bootloader_api::info::{FrameBufferInfo, PixelFormat};
+use bootloader_api::info::FrameBufferInfo;
 use constants::font_constants;
 use constants::font_constants::{BACKUP_CHAR, CHAR_RASTER_HEIGHT, FONT_WEIGHT};
 use noto_sans_mono_bitmap::{get_raster, RasterizedChar};
@@ -11,6 +11,10 @@ use noto_sans_mono_bitmap::{get_raster, RasterizedChar};
 const LINE_SPACING: usize = 2;
 const LETTER_SPACING: usize = 0;
 const BORDER_PADDING: usize = 1;
+
+// ANSI-like color codes
+const COLOR_PURPLE: [u8; 3] = [255, 192, 203]; // RGB for purple
+const COLOR_WHITE: [u8; 3] = [255, 255, 255]; // RGB for white (default color)
 
 fn get_char_raster(c: char) -> RasterizedChar {
     fn get(c: char) -> Option<RasterizedChar> {
@@ -24,39 +28,128 @@ pub struct FrameBufferWriter {
     info: FrameBufferInfo,
     x_pos: usize,
     y_pos: usize,
-    scroll_offset: usize,
-    
+    current_color: [u8; 3],
 }
 
 impl FrameBufferWriter {
     pub fn new(framebuffer: &'static mut [u8], info: FrameBufferInfo) -> Self {
-        let mut logger = Self {
+        let mut writer = Self {
             framebuffer,
             info,
-            x_pos: 0,
-            y_pos: 0,
-            scroll_offset: 0,  // New field
+            x_pos: BORDER_PADDING,
+            y_pos: BORDER_PADDING,
+            current_color: COLOR_WHITE,
         };
-        logger.clear();
-        logger
+        writer.clear();
+        writer
     }
 
-    fn newline(&mut self) {
-        self.y_pos += CHAR_RASTER_HEIGHT.val() + LINE_SPACING;
-        self.carriage_return();
-        if self.y_pos >= self.height() {
-            self.scroll();
+    /// Prints text with automatic wrapping, scrolling, and ANSI-like escape sequences.
+    pub fn print(&mut self, text: &str) {
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        match next {
+                            'c' => self.current_color = COLOR_PURPLE,  // Change to purple
+                            'r' => self.current_color = COLOR_WHITE, // Reset to white
+                            _ => self.write_char(c),                // Unknown sequence
+                        }
+                    }
+                }
+                '\n' => self.newline(),
+                '\t' => self.indent_tab(),
+                _ => self.write_char(c),
+            }
         }
     }
 
-    fn carriage_return(&mut self) {
+    fn newline(&mut self) {
         self.x_pos = BORDER_PADDING;
+        self.y_pos += CHAR_RASTER_HEIGHT.val() + LINE_SPACING;
+        if self.y_pos + CHAR_RASTER_HEIGHT.val() >= self.height() {
+            self.scroll_up();
+        }
+    }
+
+    fn scroll_up(&mut self) {
+        let row_height = CHAR_RASTER_HEIGHT.val() + LINE_SPACING;
+        let offset = self.info.stride * row_height;
+
+        // Shift framebuffer content up
+        self.framebuffer.copy_within(offset.., 0);
+
+        // Clear the last row
+        let start_of_last_row = self.framebuffer.len() - self.width() * row_height;
+        for pixel in &mut self.framebuffer[start_of_last_row..] {
+            *pixel = 0;
+        }
+
+        self.y_pos = self.height() - row_height;
+    }
+
+    fn indent_tab(&mut self) {
+        for _ in 0..4 {
+            self.write_char(' ');
+        }
+    }
+
+    fn write_char(&mut self, c: char) {
+        if c == '\n' {
+            self.newline();
+            return;
+        }
+
+        let char_width = font_constants::CHAR_RASTER_WIDTH;
+        if self.x_pos + char_width >= self.width() {
+            self.newline();
+        }
+
+        let char_height = CHAR_RASTER_HEIGHT.val();
+        if self.y_pos + char_height >= self.height() {
+            self.scroll_up();
+        }
+
+        self.write_rendered_char(get_char_raster(c));
+    }
+
+    fn write_rendered_char(&mut self, rendered_char: RasterizedChar) {
+        let x_start = self.x_pos;
+        let y_start = self.y_pos;
+
+        for (y, row) in rendered_char.raster().iter().enumerate() {
+            for (x, byte) in row.iter().enumerate() {
+                if *byte > 0 {
+                    self.write_pixel(x_start + x, y_start + y, *byte);
+                }
+            }
+        }
+
+        self.x_pos += rendered_char.width() + LETTER_SPACING;
+    }
+
+    fn write_pixel(&mut self, x: usize, y: usize, intensity: u8) {
+        if x >= self.width() || y >= self.height() {
+            return;
+        }
+
+        let pixel_offset = y * self.info.stride + x;
+        let color = [
+            (self.current_color[0] as u16 * intensity as u16 / 255) as u8,
+            (self.current_color[1] as u16 * intensity as u16 / 255) as u8,
+            (self.current_color[2] as u16 * intensity as u16 / 255) as u8,
+        ];
+        let bytes_per_pixel = self.info.bytes_per_pixel;
+        let byte_offset = pixel_offset * bytes_per_pixel;
+        self.framebuffer[byte_offset..(byte_offset + bytes_per_pixel)]
+            .copy_from_slice(&color[..bytes_per_pixel]);
+        let _ = unsafe { ptr::read_volatile(&self.framebuffer[byte_offset]) };
     }
 
     pub fn clear(&mut self) {
         self.x_pos = BORDER_PADDING;
         self.y_pos = BORDER_PADDING;
-        self.scroll_offset = 0;
         self.framebuffer.fill(0);
     }
 
@@ -67,102 +160,6 @@ impl FrameBufferWriter {
     fn height(&self) -> usize {
         self.info.height
     }
-
-    fn write_char(&mut self, c: char) {
-        match c {
-            '\n' => self.newline(),
-            '\r' => self.carriage_return(),
-            '\t' => {
-                for _ in 0..4 { self.write_char(' '); }
-            }
-            c => {
-                if self.x_pos + font_constants::CHAR_RASTER_WIDTH >= self.width() {
-                    self.newline();
-                }
-                if self.y_pos + CHAR_RASTER_HEIGHT.val() + BORDER_PADDING >= self.height() {
-                    self.scroll();
-                }
-                self.write_rendered_char(get_char_raster(c));
-                self.x_pos += font_constants::CHAR_RASTER_WIDTH;
-    
-                if self.x_pos + font_constants::CHAR_RASTER_WIDTH >= self.width() {
-                    self.newline();
-                }
-            }
-        }
-    }
-
-    fn scroll(&mut self) {
-        let char_height = CHAR_RASTER_HEIGHT.val() + LINE_SPACING;
-        let stride_bytes = self.info.stride * self.info.bytes_per_pixel;
-        let scroll_bytes = char_height * stride_bytes;
-        let height = self.height();
-    
-        // Move screen contents up by one row height
-        self.framebuffer.copy_within(scroll_bytes.., 0);
-    
-        // Clear the last row by zeroing out the new empty space
-        let clear_start = (height - char_height) * stride_bytes;
-        self.framebuffer[clear_start..].fill(0);
-    
-        // Adjust cursor position
-        self.y_pos -= char_height;
-    }
-
-    fn scroll_up(&mut self) {
-        let char_height = CHAR_RASTER_HEIGHT.val() + LINE_SPACING;
-        if self.scroll_offset >= char_height {
-            self.scroll_offset -= char_height;
-            self.redraw();
-        }
-    }
-    
-    fn scroll_down(&mut self) {
-        let char_height = CHAR_RASTER_HEIGHT.val() + LINE_SPACING;
-        if self.scroll_offset + self.height() < self.info.height {
-            self.scroll_offset += char_height;
-            self.redraw();
-        }
-    }
-    
-
-    fn redraw(&mut self) {
-        let stride_bytes = self.info.stride * self.info.bytes_per_pixel;
-        let start_offset = self.scroll_offset * stride_bytes;
-        let visible_height = self.height();
-        let total_height = self.info.height;
-    
-        if start_offset + (visible_height * stride_bytes) <= self.framebuffer.len() {
-            self.framebuffer.copy_within(start_offset..(start_offset + visible_height * stride_bytes), 0);
-        }
-    }
-    
-
-    fn write_rendered_char(&mut self, rendered_char: RasterizedChar) {
-        for (y, row) in rendered_char.raster().iter().enumerate() {
-            for (x, byte) in row.iter().enumerate() {
-                self.write_pixel(self.x_pos + x, self.y_pos + y, *byte);
-            }
-        }
-        self.x_pos += rendered_char.width() + LETTER_SPACING;
-    }
-
-    fn write_pixel(&mut self, x: usize, y: usize, intensity: u8) {
-        let pixel_offset = y * self.info.stride + x;
-        let color = match self.info.pixel_format {
-            PixelFormat::Rgb => [intensity, intensity, intensity / 2, 0],
-            PixelFormat::Bgr => [intensity / 2, intensity, intensity, 0],
-            PixelFormat::U8 => [if intensity > 200 { 0xf } else { 0 }, 0, 0, 0],
-            other => {
-                self.info.pixel_format = PixelFormat::Rgb;
-                panic!("pixel format {:?} not supported in logger", other);
-            }
-        };
-        let bytes_per_pixel = self.info.bytes_per_pixel;
-        let byte_offset = pixel_offset * bytes_per_pixel;
-        self.framebuffer[byte_offset..(byte_offset + bytes_per_pixel)].copy_from_slice(&color[..bytes_per_pixel]);
-        let _ = unsafe { ptr::read_volatile(&self.framebuffer[byte_offset]) };
-    }
 }
 
 unsafe impl Send for FrameBufferWriter {}
@@ -170,9 +167,7 @@ unsafe impl Sync for FrameBufferWriter {}
 
 impl Write for FrameBufferWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for c in s.chars() {
-            self.write_char(c);
-        }
+        self.print(s);
         Ok(())
     }
 }
